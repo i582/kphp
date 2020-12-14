@@ -50,7 +50,9 @@ VertexPtr FixReturnsPass::on_enter_vertex(VertexPtr root) {
 
 bool FixReturnsPass::user_recursion(VertexPtr root) {
   if (auto fork_vertex = root.try_as<op_fork>()) {
-    for (auto arg : fork_vertex->func_call()->args()) {
+    auto func_call_vertex = fork_vertex->func_call();
+    kphp_error(tinf::get_type(func_call_vertex->func_id, -1)->ptype() != tp_void, "It is forbidden to fork void functions");
+    for (auto arg : func_call_vertex->args()) {
       run_function_pass(arg, this);
     }
     return true;
