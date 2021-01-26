@@ -1357,6 +1357,83 @@ void compile_list(VertexAdaptor<op_list> root, CodeGenerator &W) {
   }
 }
 
+bool are_array_values_integer_sequence_with_integer_keys(VertexAdaptor<op_array> root) noexcept {
+  int64_t integer_sequence = 0;
+  for (auto element : root->args()) {
+    if (auto arrow = element.try_as<op_double_arrow>()) {
+      if (GenTree::get_actual_value(arrow->key())->type() != op_int_const) {
+        return false;
+      }
+      if (auto const_int_value = GenTree::get_actual_value(arrow->value()).try_as<op_int_const>()) {
+        int64_t int_value = -1;
+        if (php_try_to_int(const_int_value->str_val.c_str(), const_int_value->str_val.size(), &int_value)) {
+          if (int_value == integer_sequence++) {
+            continue;
+          }
+        }
+      }
+    }
+    return false;
+  }
+  return true;
+}
+
+template<class T>
+bool is_ok_for_integer_type(int64_t v) noexcept {
+  return std::numeric_limits<T>::min() <= v && v <= std::numeric_limits<T>::max();
+}
+
+// This is a sort of optimization for reindex maps, should be useful for ml libs
+void compile_array_integer_sequence_value_with_integer_keys_insertions(const std::string &arr_name, VertexAdaptor<op_array> root, CodeGenerator &W) {
+  int32_t key_integer_bits = 8;
+  std::vector<int64_t> keys;
+  keys.reserve(static_cast<size_t>(root->size()));
+  for (auto element : root->args()) {
+    auto arrow = element.try_as<op_double_arrow>();
+    kphp_assert(arrow);
+    auto const_int_key = GenTree::get_actual_value(arrow->key()).try_as<op_int_const>();
+    kphp_assert(const_int_key);
+    int64_t int_key = 0;
+    bool is_ok = php_try_to_int(const_int_key->str_val.c_str(), const_int_key->str_val.size(), &int_key);
+    kphp_assert(is_ok);
+    if (is_ok_for_integer_type<int8_t>(int_key)) {
+      key_integer_bits = std::max(key_integer_bits, 8);
+    } else if (is_ok_for_integer_type<int16_t>(int_key)) {
+      key_integer_bits = std::max(key_integer_bits, 16);
+    } else if (is_ok_for_integer_type<int32_t>(int_key)) {
+      key_integer_bits = std::max(key_integer_bits, 32);
+    } else {
+      key_integer_bits = 64;
+    }
+    keys.emplace_back(int_key);
+  }
+
+  W << "static constexpr std::array<int" << key_integer_bits << "_t, " << root->size() << "> " << arr_name << "_keys = " << BEGIN;
+  for (int64_t key : keys) {
+    W << key << (key_integer_bits == 64 ? "_i64, " : ", ");
+  }
+  W << NL << END << ";" << NL;
+  W << "for(int64_t array_value = 0; array_value != " << root->size() << "; ++array_value) " << BEGIN
+    << arr_name << ".emplace_value(" << "int64_t{" << arr_name << "_keys[array_value]}, array_value);" << NL
+    << END << NL;
+}
+
+void compile_array_values_insertions(const std::string &arr_name, VertexAdaptor<op_array> root, CodeGenerator &W) {
+  for (auto cur : root->args()) {
+    W << arr_name;
+    if (auto arrow = cur.try_as<op_double_arrow>()) {
+      W << ".set_value (" << arrow->key() << ", " << arrow->value();
+      if (auto precomputed_hash = can_use_precomputed_hash_indexing_array(arrow->key())) {
+        W << ", " << precomputed_hash << "_i64";
+      }
+      W << ")";
+    } else {
+      W << ".emplace_back (" << cur << ")";
+    }
+
+    W << ";" << NL;
+  }
+}
 
 void compile_array(VertexAdaptor<op_array> root, CodeGenerator &W) {
   int n = (int)root->args().size();
@@ -1368,40 +1445,45 @@ void compile_array(VertexAdaptor<op_array> root, CodeGenerator &W) {
   }
 
   bool has_double_arrow = false;
-  int int_cnt = 0, string_cnt = 0, xx_cnt = 0;
+  size_t int_cnt = 0;
+  size_t string_cnt = 0;
+  size_t xx_cnt = 0;
   for (size_t key_id = 0; key_id < root->args().size(); ++key_id) {
-    if (auto arrow = root->args()[key_id].try_as<op_double_arrow>()) {
-      VertexPtr key = GenTree::get_actual_value(arrow->key());
-      if (!has_double_arrow && key->type() == op_int_const) {
-        if (key.as<op_int_const>()->str_val == std::to_string(key_id)) {
-          root->args()[key_id] = arrow->value();
-          continue;
-        }
+    auto arrow = root->args()[key_id].try_as<op_double_arrow>();
+    if (!arrow) {
+      int_cnt++;
+      continue;
+    }
+    VertexPtr key = GenTree::get_actual_value(arrow->key());
+    if (!has_double_arrow && key->type() == op_int_const) {
+      if (key.as<op_int_const>()->str_val == std::to_string(key_id)) {
+        root->args()[key_id] = arrow->value();
+        continue;
       }
-      has_double_arrow = true;
-      PrimitiveType tp = tinf::get_type(key)->ptype();
-      if (tp == tp_int) {
+    }
+    has_double_arrow = true;
+    const PrimitiveType key_tp = tinf::get_type(key)->ptype();
+    if (key_tp == tp_int) {
+      int_cnt++;
+      continue;
+    }
+    if (key_tp == tp_string && key->type() == op_string) {
+      const std::string &key_str = key.as<op_string>()->str_val;
+      if (php_is_int(key_str.c_str(), key_str.size())) {
         int_cnt++;
       } else {
-        if (tp == tp_string && key->type() == op_string) {
-          const string &key_str = key.as<op_string>()->str_val;
-          if (php_is_int(key_str.c_str(), key_str.size())) {
-            int_cnt++;
-          } else {
-            string_cnt++;
-          }
-        } else {
-          xx_cnt++;
-        }
+        string_cnt++;
       }
     } else {
-      int_cnt++;
+      xx_cnt++;
     }
   }
+
   if (n <= 10 && !has_double_arrow && type->ptype() == tp_array && root->extra_type != op_ex_safe_version) {
     W << TypeName(type) << "::create(" << JoinValues(*root, ", ") << ")";
     return;
   }
+
 
   W << "(" << BEGIN;
 
@@ -1418,19 +1500,10 @@ void compile_array(VertexAdaptor<op_array> root, CodeGenerator &W) {
     << int_cnt + xx_cnt << ", "
     << string_cnt + xx_cnt << ", "
     << (has_double_arrow ? "false" : "true") << "));" << NL;
-  for (auto cur : root->args()) {
-    W << arr_name;
-    if (auto arrow = cur.try_as<op_double_arrow>()) {
-      W << ".set_value (" << arrow->key() << ", " << arrow->value();
-      if (auto precomputed_hash = can_use_precomputed_hash_indexing_array(arrow->key())) {
-        W << ", " << precomputed_hash << "_i64";
-      }
-      W << ")";
-    } else {
-      W << ".push_back (" << cur << ")";
-    }
-
-    W << ";" << NL;
+  if (are_array_values_integer_sequence_with_integer_keys(root)) {
+    compile_array_integer_sequence_value_with_integer_keys_insertions(arr_name, root, W);
+  } else {
+    compile_array_values_insertions(arr_name, root, W);
   }
 
   W << arr_name << ";" << NL <<
