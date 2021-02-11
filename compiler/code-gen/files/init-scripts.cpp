@@ -202,3 +202,22 @@ void InitScriptsCpp::compile(CodeGenerator &W) const {
 
   W << CloseFile();
 }
+
+void LibVersionHFile::compile(CodeGenerator &W) const {
+  W << OpenFile("_lib_version.h");
+  W << "// Runtime sha256: " << G->settings().runtime_sha256.get() << NL;
+  W << "// CXX: " << G->settings().cxx.get() << NL;
+  W << "// CXXFLAGS DEFAULT: " << G->settings().cxx_flags_default.flags.get() << NL;
+  W << "// CXXFLAGS WITH EXTRA: " << G->settings().cxx_flags_with_debug.flags.get() << NL;
+  W << CloseFile();
+}
+
+void CppMainFile::compile(CodeGenerator &W) const {
+  kphp_assert(G->settings().is_server_mode() || G->settings().is_cli_mode());
+  W << OpenFile("main.cpp");
+  W << ExternInclude("server/php-engine.h") << NL;
+  W << "int main(int argc, char *argv[]) " << BEGIN
+    << "return run_main(argc, argv, php_mode::" << G->settings().mode.get() << ")" << SemicolonAndNL{}
+    << END;
+  W << CloseFile();
+}

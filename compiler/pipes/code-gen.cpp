@@ -32,7 +32,7 @@ size_t CodeGenF::calc_count_of_parts(size_t cnt_global_vars) {
   return 1u + cnt_global_vars / G->settings().globals_split_count.get();
 }
 
-void CodeGenF::on_finish(DataStream<WriterData> &os) {
+void CodeGenF::on_finish(DataStream<WriterData *> &os) {
   vk::singleton<CppDestDirInitializer>::get().wait();
 
   stage::set_name("GenerateCode");
@@ -42,10 +42,6 @@ void CodeGenF::on_finish(DataStream<WriterData> &os) {
   auto xall = tmp_stream.flush();
   xall.sort();
   const vector<ClassPtr> &all_classes = G->get_classes();
-
-  //TODO: delete W_ptr
-  CodeGenerator *W_ptr = new CodeGenerator(os);
-  CodeGenerator &W = *W_ptr;
 
   FunctionPtr main_function = G->get_main_file()->main_function;
 
@@ -78,8 +74,8 @@ void CodeGenF::on_finish(DataStream<WriterData> &os) {
       continue;
     }
     all_functions.push_back(function);
-    W << Async(FunctionH(function));
-    W << Async(FunctionCpp(function));
+    code_gen_start_root_task(os, FunctionH(function));
+    code_gen_start_root_task(os, FunctionCpp(function));
 
     if (function->kphp_lib_export && G->settings().is_static_lib_mode()) {
       exported_functions.emplace_back(function);
@@ -93,10 +89,10 @@ void CodeGenF::on_finish(DataStream<WriterData> &os) {
 
     switch (c->class_type) {
       case ClassType::klass:
-        W << Async(ClassDeclaration(c));
+        code_gen_start_root_task(os, ClassDeclaration(c));
         break;
       case ClassType::interface:
-        W << Async(InterfaceDeclaration(c));
+        code_gen_start_root_task(os, InterfaceDeclaration(c));
         break;
 
       case ClassType::trait:
@@ -106,35 +102,34 @@ void CodeGenF::on_finish(DataStream<WriterData> &os) {
     }
   }
 
-  W << Async(GlobalVarsReset(G->get_main_file()));
+  code_gen_start_root_task(os, GlobalVarsReset(G->get_main_file()));
   if (G->settings().enable_global_vars_memory_stats.get()) {
-    W << Async(GlobalVarsMemoryStats{G->get_main_file()});
+    code_gen_start_root_task(os, GlobalVarsMemoryStats{G->get_main_file()});
   }
-  W << Async(InitScriptsCpp(G->get_main_file(), std::move(all_functions)));
+  code_gen_start_root_task(os, InitScriptsCpp(G->get_main_file(), std::move(all_functions)));
 
   std::vector<VarPtr> vars = G->get_global_vars();
   for (FunctionPtr fun: xall) {
     vars.insert(vars.end(), fun->static_var_ids.begin(), fun->static_var_ids.end());
   }
   size_t parts_cnt = calc_count_of_parts(vars.size());
-  W << Async(VarsCpp(std::move(vars), parts_cnt));
+  code_gen_start_root_task(os, VarsCpp(std::move(vars), parts_cnt));
 
   if (G->settings().is_static_lib_mode()) {
     for (FunctionPtr exported_function: exported_functions) {
-      W << Async(LibHeaderH(exported_function));
+      code_gen_start_root_task(os, LibHeaderH(exported_function));
     }
-    W << Async(LibHeaderTxt(std::move(exported_functions)));
-    W << Async(StaticLibraryRunGlobalHeaderH());
+    code_gen_start_root_task(os, LibHeaderTxt(std::move(exported_functions)));
+    code_gen_start_root_task(os, StaticLibraryRunGlobalHeaderH());
   } else {
     // TODO: should be done in lib mode, but by some other way
-    W << Async(TypeTagger(vk::singleton<ForkableTypeStorage>::get().flush_forkable_types(), vk::singleton<ForkableTypeStorage>::get().flush_waitable_types()));
+    code_gen_start_root_task(os, TypeTagger(vk::singleton<ForkableTypeStorage>::get().flush_forkable_types(), vk::singleton<ForkableTypeStorage>::get().flush_waitable_types()));
   }
 
-  //TODO: use Async for that
-  tl2cpp::write_tl_query_handlers(W);
-  write_lib_version(W);
+  code_gen_start_root_task(os, TlSchemaToCpp());
+  code_gen_start_root_task(os, LibVersionHFile());
   if (!G->settings().is_static_lib_mode()) {
-    write_main(W);
+    code_gen_start_root_task(os, CppMainFile());
   }
 }
 
@@ -162,25 +157,6 @@ void CodeGenF::prepare_generate_function(FunctionPtr func) {
 string CodeGenF::get_subdir(const string &base) {
   int bucket = vk::std_hash(base) % 100;
   return "o_" + std::to_string(bucket);
-}
-
-void CodeGenF::write_lib_version(CodeGenerator &W) {
-  W << OpenFile("_lib_version.h");
-  W << "// Runtime sha256: " << G->settings().runtime_sha256.get() << NL;
-  W << "// CXX: " << G->settings().cxx.get() << NL;
-  W << "// CXXFLAGS DEFAULT: " << G->settings().cxx_flags_default.flags.get() << NL;
-  W << "// CXXFLAGS WITH EXTRA: " << G->settings().cxx_flags_with_debug.flags.get() << NL;
-  W << CloseFile();
-}
-
-void CodeGenF::write_main(CodeGenerator &W) {
-  kphp_assert(G->settings().is_server_mode() || G->settings().is_cli_mode());
-  W << OpenFile("main.cpp");
-  W << ExternInclude("server/php-engine.h") << NL;
-  W << "int main(int argc, char *argv[]) " << BEGIN
-    << "return run_main(argc, argv, php_mode::" << G->settings().mode.get() << ")" << SemicolonAndNL{}
-    << END;
-  W << CloseFile();
 }
 
 void CodeGenF::prepare_generate_class(ClassPtr) {

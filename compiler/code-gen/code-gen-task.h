@@ -12,39 +12,26 @@
 ProfilerRaw &get_code_gen_profiler();
 
 template<class T>
-class CodeGenTask : public Task {
+class CodeGenSchedulerTask : public Task {
 private:
   CodeGenerator W;
   T cmd;
 public:
-  CodeGenTask(const CodeGenerator &W, const T &cmd) :
-    W(W),
+  CodeGenSchedulerTask(DataStream<WriterData *> &os, const T &cmd) :
+    W(os),
     cmd(cmd) {
   }
 
   void execute() {
     AutoProfiler profler{get_code_gen_profiler()};
-    stage::set_name("Async code generation");
-
+    stage::set_name("Code generation");
     // uncomment this to launch codegen twice and ensure there is no diff (codegeneration is idempotent)
-    // W << cmd;
-                    
-    W << cmd;
+    // cmd.compile(W);
+    cmd.compile(W);
   }
 };
 
 template<class T>
-struct AsyncImpl {
-  const T &cmd;
-  AsyncImpl(const T &cmd) :
-    cmd(cmd) {
-  }
-  void compile(CodeGenerator &W) const {
-    register_async_task(new CodeGenTask<T>(W, cmd));
-  }
-};
-
-template<class T>
-AsyncImpl<T> Async(const T &cmd) {
-  return AsyncImpl<T>(cmd);
+void code_gen_start_root_task(DataStream<WriterData *> &os, const T &cmd) {
+  register_async_task(new CodeGenSchedulerTask<T>(os, cmd));
 }
