@@ -4,9 +4,9 @@
 
 #pragma once
 
-class CodeGenerator;
+#include "compiler/code-gen/code-gen-root-cmd.h"
+#include "compiler/code-gen/code-generator.h"
 
-namespace tl2cpp {
-void write_tl_query_handlers(CodeGenerator &W);
-
-} // namespace tl_gen
+struct TlSchemaToCpp : CodeGenRootCmd {
+  void compile(CodeGenerator &W) const final;
+};

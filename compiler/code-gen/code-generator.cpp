@@ -4,6 +4,7 @@
 
 #include "compiler/code-gen/code-generator.h"
 
+
 void CodeGenerator::open_file_create_writer(bool compile_with_debug_info_flag, bool compile_with_crc, const std::string &file_name, const std::string &subdir) {
   kphp_assert(data == nullptr);
   data = new WriterData(compile_with_debug_info_flag, compile_with_crc, file_name, subdir);

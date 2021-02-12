@@ -74,8 +74,8 @@ void CodeGenF::on_finish(DataStream<WriterData *> &os) {
       continue;
     }
     all_functions.push_back(function);
-    code_gen_start_root_task(os, FunctionH(function));
-    code_gen_start_root_task(os, FunctionCpp(function));
+    code_gen_start_root_task(os, std::make_unique<FunctionH>(function));
+    code_gen_start_root_task(os, std::make_unique<FunctionCpp>(function));
 
     if (function->kphp_lib_export && G->settings().is_static_lib_mode()) {
       exported_functions.emplace_back(function);
@@ -89,10 +89,10 @@ void CodeGenF::on_finish(DataStream<WriterData *> &os) {
 
     switch (c->class_type) {
       case ClassType::klass:
-        code_gen_start_root_task(os, ClassDeclaration(c));
+        code_gen_start_root_task(os, std::make_unique<ClassDeclaration>(c));
         break;
       case ClassType::interface:
-        code_gen_start_root_task(os, InterfaceDeclaration(c));
+        code_gen_start_root_task(os, std::make_unique<InterfaceDeclaration>(c));
         break;
 
       case ClassType::trait:
@@ -102,34 +102,34 @@ void CodeGenF::on_finish(DataStream<WriterData *> &os) {
     }
   }
 
-  code_gen_start_root_task(os, GlobalVarsReset(G->get_main_file()));
+  code_gen_start_root_task(os, std::make_unique<GlobalVarsReset>(G->get_main_file()));
   if (G->settings().enable_global_vars_memory_stats.get()) {
-    code_gen_start_root_task(os, GlobalVarsMemoryStats{G->get_main_file()});
+    code_gen_start_root_task(os, std::make_unique<GlobalVarsMemoryStats>(G->get_main_file()));
   }
-  code_gen_start_root_task(os, InitScriptsCpp(G->get_main_file(), std::move(all_functions)));
+  code_gen_start_root_task(os, std::make_unique<InitScriptsCpp>(G->get_main_file(), std::move(all_functions)));
 
   std::vector<VarPtr> vars = G->get_global_vars();
   for (FunctionPtr fun: xall) {
     vars.insert(vars.end(), fun->static_var_ids.begin(), fun->static_var_ids.end());
   }
   size_t parts_cnt = calc_count_of_parts(vars.size());
-  code_gen_start_root_task(os, VarsCpp(std::move(vars), parts_cnt));
+  code_gen_start_root_task(os, std::make_unique<VarsCpp>(std::move(vars), parts_cnt));
 
   if (G->settings().is_static_lib_mode()) {
     for (FunctionPtr exported_function: exported_functions) {
-      code_gen_start_root_task(os, LibHeaderH(exported_function));
+      code_gen_start_root_task(os, std::make_unique<LibHeaderH>(exported_function));
     }
-    code_gen_start_root_task(os, LibHeaderTxt(std::move(exported_functions)));
-    code_gen_start_root_task(os, StaticLibraryRunGlobalHeaderH());
+    code_gen_start_root_task(os, std::make_unique<LibHeaderTxt>(std::move(exported_functions)));
+    code_gen_start_root_task(os, std::make_unique<StaticLibraryRunGlobalHeaderH>());
   } else {
     // TODO: should be done in lib mode, but by some other way
-    code_gen_start_root_task(os, TypeTagger(vk::singleton<ForkableTypeStorage>::get().flush_forkable_types(), vk::singleton<ForkableTypeStorage>::get().flush_waitable_types()));
+    code_gen_start_root_task(os, std::make_unique<TypeTagger>(vk::singleton<ForkableTypeStorage>::get().flush_forkable_types(), vk::singleton<ForkableTypeStorage>::get().flush_waitable_types()));
   }
 
-  code_gen_start_root_task(os, TlSchemaToCpp());
-  code_gen_start_root_task(os, LibVersionHFile());
+  code_gen_start_root_task(os, std::make_unique<TlSchemaToCpp>());
+  code_gen_start_root_task(os, std::make_unique<LibVersionHFile>());
   if (!G->settings().is_static_lib_mode()) {
-    code_gen_start_root_task(os, CppMainFile());
+    code_gen_start_root_task(os, std::make_unique<CppMainFile>());
   }
 }
 

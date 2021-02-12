@@ -35,7 +35,7 @@ private:
 
 public:
 
-  explicit CodeGenerator(DataStream<WriterData *> &os) : os(os) {}
+  explicit CodeGenerator(DataStream<WriterData *> &os): os(os) {}
   ~CodeGenerator() = default;
 
   CodeGenerator(const CodeGenerator &from) = delete;
