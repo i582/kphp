@@ -32,7 +32,7 @@ size_t CodeGenF::calc_count_of_parts(size_t cnt_global_vars) {
   return 1u + cnt_global_vars / G->settings().globals_split_count.get();
 }
 
-void CodeGenF::on_finish(DataStream<WriterData *> &os) {
+void CodeGenF::on_finish(DataStream<std::unique_ptr<CodeGenRootCmd>> &os) {
   vk::singleton<CppDestDirInitializer>::get().wait();
 
   stage::set_name("GenerateCode");
@@ -160,4 +160,14 @@ string CodeGenF::get_subdir(const string &base) {
 }
 
 void CodeGenF::prepare_generate_class(ClassPtr) {
+}
+
+void CodeGenForDiffF::execute(std::unique_ptr<CodeGenRootCmd> cmd, DataStream<WriterData *> &os) {
+  stage::set_name("Code generation for diff");
+
+  // re-launch cmd not with "calc hashes", but with "store cpp/h contents and php comments" mode
+  // all generated files will be passed to os (to WriteFilesF)
+  CodeGenerator W(false, os);
+  cmd->compile(W);
+  // now cmd is destroyed
 }
