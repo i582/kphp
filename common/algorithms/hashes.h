@@ -56,7 +56,7 @@ public:
 };
 
 template<class T>
-size_t std_hash(const T &obj) {
+inline size_t std_hash(const T &obj) {
   static_assert(!std::is_same<T, const char *>{}, "You don't want to use std::hash with `const char *`");
   return std::hash<T>{}(obj);
 }
