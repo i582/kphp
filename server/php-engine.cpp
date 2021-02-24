@@ -1477,16 +1477,6 @@ int rpcx_func_close(connection *c, int who __attribute__((unused))) {
   return 0;
 }
 
-static bool check_tasks_invoker_pid(process_id_t tasks_invoker_pid) {
-  process_id_t lease_pid = get_lease_pid();
-  return matches_pid(&tasks_invoker_pid, &lease_pid) != no_pid_match;
-}
-
-static bool check_tasks_manager_pid(process_id_t tasks_manager_pid) {
-  process_id_t rpc_main_target_pid = get_rpc_main_target_pid();
-  return matches_pid(&tasks_manager_pid, &rpc_main_target_pid) != no_pid_match;
-}
-
 static double normalize_script_timeout(double timeout_sec) {
   if (timeout_sec < 1) {
     kprintf("Too small script timeout: %f sec, should be [%d..%d] sec", timeout_sec, 1, MAX_SCRIPT_TIMEOUT);
