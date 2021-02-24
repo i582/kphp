@@ -1514,6 +1514,14 @@ int rpcx_execute(connection *c, int op, raw_message *raw) {
   process_id remote_pid = TCP_RPC_DATA(c)->remote_pid;
 
   switch (static_cast<unsigned int>(op)) {
+    case TL_KPHP_STOP_READY_ACKNOWLEDGMENT: {
+      if (!check_tasks_invoker_pid(remote_pid)) {
+        kprintf("Got TL_KPHP_STOP_READY_ACKNOWLEDGMENT from invalid task invoker\n");
+        return 0;
+      }
+      do_rpc_finish_lease();
+      break;
+    }
     case TL_KPHP_STOP_LEASE: {
       if (in_sigterm) {
         return 0;

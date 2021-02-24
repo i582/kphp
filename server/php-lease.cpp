@@ -6,6 +6,7 @@
 
 #include "common/options.h"
 #include "common/precise-time.h"
+#include "common/timer.h"
 #include "common/tl/constants/common.h"
 #include "common/tl/constants/kphp.h"
 #include "common/tl/methods/string.h"
@@ -38,11 +39,19 @@ double lease_stats_time;
 long long lease_stats_cnt;
 int ready_cnt = 0;
 
+bool rpc_finish_ack_received = false;
+vk::SteadyTimer<std::chrono::milliseconds> rpc_finish_ack_timer;
+
+bool is_finish_ack_timeout_expired() {
+  return rpc_finish_ack_timer.time() > std::chrono::seconds{1};
+}
+
 enum class lease_state_t {
-  off,            // connect to rpc-proxy, wait kphp.startLease from it, connect to target
-  start,          // if !has_pending_scripts -> change state to lease_state_t::on, wait for connection to target ready, do lease_set_ready() && run_rpc_lease();
-  on,             // connecting to target, send RPC_READY, doing work, if too much time doing work -> change state to lease_state_t::finish
-  finish          // wait finishing current task, send RPC_STOP to target, send TL_KPHP_LEASE_STATS to rpc-proxy, change state to lease_state_t::off
+  off,               // connect to rpc-proxy, wait kphp.startLease from it, connect to target
+  start,             // if !has_pending_scripts -> change state to lease_state_t::on, wait for connection to target ready, do lease_set_ready() && run_rpc_lease();
+  on,                // connecting to target, send RPC_READY, doing work, if too much time doing work -> change state to lease_state_t::initiating_finish
+  initiating_finish, // wait finishing current task, send RPC_STOP to target, send TL_KPHP_LEASE_STATS to rpc-proxy, change state to lease_state_t::finish
+  finish,            // wait TL_KPHP_STOP_READY_ACKNOWLEDGMENT from target with 1 sec timeout, then change state to lease_state_t::off
 };
 
 lease_state_t lease_state = lease_state_t::off;
@@ -89,7 +98,7 @@ static void lease_change_state(lease_state_t new_state) {
 }
 
 void lease_on_worker_finish(php_worker *worker) {
-  if ((lease_state == lease_state_t::on || lease_state == lease_state_t::finish) && worker->target_fd == rpc_lease_target) {
+  if ((lease_state == lease_state_t::on || lease_state == lease_state_t::initiating_finish) && worker->target_fd == rpc_lease_target) {
     double worked = precise_now - worker->start_time;
     lease_stats_time += worked;
     lease_stats_cnt++;
@@ -240,6 +249,19 @@ static int lease_off() {
   return 0;
 }
 
+static int lease_start() {
+  assert(lease_state == lease_state_t::start);
+  if (has_pending_scripts()) {
+    return 0;
+  }
+  lease_change_state(lease_state_t::on);
+  lease_ready_flag = 1;
+  if (rpc_stopped) {
+    lease_change_state(lease_state_t::initiating_finish);
+  }
+  return 1;
+}
+
 static int lease_on() {
   assert(lease_state == lease_state_t::on);
   if (!lease_ready_flag) {
@@ -256,16 +278,17 @@ static int lease_on() {
   return 0;
 }
 
-static int lease_start() {
-  assert(lease_state == lease_state_t::start);
+static int lease_initiating_finish() {
+  assert(lease_state == lease_state_t::initiating_finish);
   if (has_pending_scripts()) {
     return 0;
   }
-  lease_change_state(lease_state_t::on);
-  lease_ready_flag = 1;
-  if (rpc_stopped) {
-    lease_change_state(lease_state_t::finish);
-  }
+  rpct_stop_ready(rpc_lease_target);
+  rpc_finish_ack_timer.start();
+
+  rpct_lease_stats(rpc_proxy_target);
+  lease_change_state(lease_state_t::finish);
+  lease_ready_flag = 0; // waiting TL_KPHP_STOP_READY_ACKNOWLEDGMENT
   return 1;
 }
 
@@ -274,11 +297,18 @@ static int lease_finish() {
   if (has_pending_scripts()) {
     return 0;
   }
-  rpct_stop_ready(rpc_lease_target);
-  rpct_lease_stats(rpc_proxy_target);
-  lease_change_state(lease_state_t::finish);
-  lease_ready_flag = 1;
-  return 1;
+  if (rpc_finish_ack_received || is_finish_ack_timeout_expired()) {
+    lease_change_state(lease_state_t::off);
+    lease_ready_flag = 1;
+
+    rpc_finish_ack_received = false;
+    rpc_finish_ack_timer.reset();
+    return 1;
+  } else {
+    lease_ready_flag = 0; // waiting TL_KPHP_STOP_READY_ACKNOWLEDGMENT,
+                          // then lease_ready_flag set to 1 in rpcx_execute on ACK receiving or run_rpc_lease run directly in lease_cron on timeout expiring
+    return 0;
+  }
 }
 
 void run_rpc_lease() {
@@ -294,6 +324,9 @@ void run_rpc_lease() {
       case lease_state_t::on:
         run_flag = lease_on();
         break;
+      case lease_state_t::initiating_finish:
+        run_flag = lease_initiating_finish();
+        break;
       case lease_state_t::finish:
         run_flag = lease_finish();
         break;
@@ -307,9 +340,14 @@ void lease_cron() {
   int need = 0;
 
   if (lease_state == lease_state_t::on && rpc_lease_timeout < precise_now) {
-    lease_change_state(lease_state_t::finish);
+    lease_change_state(lease_state_t::initiating_finish);
     need = 1;
   }
+
+  if (lease_state == lease_state_t::finish && is_finish_ack_timeout_expired()) {
+    need = 1;
+  }
+
   if (lease_ready_flag) {
     need = 1;
   }
@@ -323,7 +361,7 @@ void do_rpc_stop_lease() {
   if (lease_state != lease_state_t::on) {
     return;
   }
-  lease_change_state(lease_state_t::finish);
+  lease_change_state(lease_state_t::initiating_finish);
   run_rpc_lease();
 }
 
@@ -359,6 +397,14 @@ int do_rpc_start_lease(process_id_t pid, double timeout) {
   run_rpc_lease();
 
   return 0;
+}
+
+void do_rpc_finish_lease() {
+  if (lease_state != lease_state_t::finish) {
+    return;
+  }
+  rpc_finish_ack_received = true;
+  run_rpc_lease();
 }
 
 
