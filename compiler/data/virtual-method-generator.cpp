@@ -12,7 +12,7 @@
 #include "compiler/data/class-data.h"
 #include "compiler/data/function-data.h"
 #include "compiler/data/src-file.h"
-#include "compiler/debug.h"
+#include "compiler/type-hint.h"
 #include "compiler/gentree.h"
 #include "compiler/stage.h"
 
@@ -29,6 +29,125 @@ VertexAdaptor<op_func_call> create_instance_cast_to(VertexAdaptor<op_var> instan
   auto cast_to_derived = create_call_with_var_and_class_name_params(instance_var, derived);
   cast_to_derived->set_string("instance_cast");
   return cast_to_derived;
+}
+
+// derived type can be more specific than the base type (covariance)
+// see https://www.php.net/manual/en/language.oop5.variance.php
+// note: the PHP docs lie about int<->float, int is not considered to be a more specific type
+bool return_type_hints_compatible(const TypeHint* base, const TypeHint* derived) {
+  // no base type hint -> anything is allowed
+  // identical type hint -> OK
+  if (!base || base == derived) {
+    return true;
+  }
+  if (!derived) {
+    return false;
+  }
+
+  // temporary kludge
+  // REMOVE ME, DO NOT SUBMIT
+  if (const auto *base_primitive = base->try_as<TypeHintPrimitive>()) {
+    if (base_primitive->ptype == tp_void) {
+      return true;
+    }
+  }
+
+  // handle variadic arguments `T ...$param`
+  if (const auto *base_array = base->try_as<TypeHintArray>()) {
+    if (const auto *derived_array = derived->try_as<TypeHintArray>()) {
+      return return_type_hints_compatible(base_array->inner, derived_array->inner);
+    }
+  }
+
+  if (const auto *base_optional = base->try_as<TypeHintOptional>()) {
+    if (const auto *derived_optional = derived->try_as<TypeHintOptional>()) {
+      return base_optional->or_null && !base_optional->or_false &&
+             derived_optional->or_null && !derived_optional->or_false &&
+             return_type_hints_compatible(base_optional->inner, derived_optional->inner);
+    }
+    if (base_optional->or_null && !base_optional->or_false) {
+      // covariance allows base `?T` type to be compared as `T`, but not the other way around
+      return base_optional->or_null && !base_optional->or_false &&
+             return_type_hints_compatible(base_optional->inner, derived);
+    }
+    // or-false types are handled below
+  }
+
+  // can't use Assumption::extract_instance_from_type_hint as it will
+  // unwrap the TypeHintOptional here
+  if (const auto *base_instance = base->try_as<TypeHintInstance>()) {
+    if (const auto *derived_instance = derived->try_as<TypeHintInstance>()) {
+      return base_instance->resolve()->is_parent_of(derived_instance->resolve());
+    }
+  }
+
+  // this is not compliant to the PHP behavior as we would allow
+  // a mixture of incompatible unions here, but this can be improved in future;
+  //
+  // we'll probably want to sort (by hash?) all TypeHintPipe items to make
+  // their full comparison faster (without a map or N^2 complexity)
+  if (base->is_typedata_constexpr() && derived->is_typedata_constexpr()) {
+    const auto *base_td = base->to_type_data();
+    const auto *derived_td = derived->to_type_data();
+    if (base_td->ptype() == tp_float && derived_td->ptype() == tp_int) {
+      return false;
+    }
+    return is_less_or_equal_type(derived_td, base_td);
+  }
+
+  return false;
+}
+
+// derived type can be less specific than the base type (contravariance)
+// see https://www.php.net/manual/en/language.oop5.variance.php
+bool param_type_hints_compatible(const TypeHint* base, const TypeHint* derived) {
+  // doing a swap + same argument order to avoid "suspicious arguments order" inspection;
+  // we need to call a return_type_hints_compatible with reversed arguments order
+  std::swap(base, derived);
+  return return_type_hints_compatible(base, derived);
+}
+
+bool check_signatures_variance(FunctionPtr interface_function, FunctionPtr derived_method) {
+  auto derived_params = derived_method->get_params();
+  auto interface_params = interface_function->get_params();
+
+  bool type_hints_are_compatible = return_type_hints_compatible(interface_function->return_typehint, derived_method->return_typehint);
+  bool error_in_return = !type_hints_are_compatible;
+  for (int i = 1; i < interface_params.size(); i++) {
+    if (!type_hints_are_compatible) {
+      break;
+    }
+    auto interface_param = interface_params[i].as<op_func_param>();
+    auto derived_param = derived_params[i].as<op_func_param>();
+    type_hints_are_compatible = param_type_hints_compatible(interface_param->type_hint, derived_param->type_hint);
+  }
+  if (!type_hints_are_compatible) {
+    if (error_in_return) {
+      printf("%s\n", fmt_format("base return type ({}): {}",
+                                interface_function->class_id->name,
+                                interface_function->return_typehint->as_human_readable()).c_str());
+      printf("%s\n", fmt_format("derived return type ({}): {}",
+                                derived_method->class_id->name,
+                                derived_method->return_typehint ? derived_method->return_typehint->as_human_readable() : "NONE").c_str());
+    } else {
+      for (int i = 1; i < interface_params.size(); i++) {
+        auto interface_param = interface_params[i].as<op_func_param>();
+        auto derived_param = derived_params[i].as<op_func_param>();
+        printf("%s\n", fmt_format("base ({}) param[{}]: {}",
+                                  interface_function->class_id->name,
+                                  interface_param->var()->str_val,
+                                  interface_param->type_hint ? interface_param->type_hint->as_human_readable() : "NONE").c_str());
+        printf("%s\n", fmt_format("derived ({}) param[{}]: {}",
+                                  derived_method->class_id->name,
+                                  derived_param->var()->str_val,
+                                  derived_param->type_hint ? derived_param->type_hint->as_human_readable() : "NONE").c_str());
+      }
+    }
+  }
+  kphp_error(type_hints_are_compatible, fmt_format("Declaration of {}() must be compatible with {}()",
+                                                   derived_method->get_human_readable_name(),
+                                                   interface_function->get_human_readable_name()));
+  return type_hints_are_compatible;
 }
 
 template<class ClassMemberMethod>
@@ -79,6 +198,13 @@ bool check_that_signatures_are_same(FunctionPtr interface_function, ClassPtr con
     return false;
   }
 
+  // non-required methods may not have enough types information to be checked here;
+  // we skip them to avoid false positives
+  if (derived_method->is_required) {
+    check_signatures_variance(interface_function, derived_method);
+  }
+
+  // do we want to return `typehints_are_compatible` here instead of `true`?
   return true;
 }
 
