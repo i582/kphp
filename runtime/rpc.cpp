@@ -5,7 +5,6 @@
 #include "runtime/rpc.h"
 
 #include <cstdarg>
-#include <utility>
 
 #include "common/rpc-error-codes.h"
 #include "common/tl/constants/common.h"
@@ -336,10 +335,38 @@ class_instance<C$RpcConnection> f$new_rpc_connection(const string &host_name, in
 }
 
 #pragma pack(push, 1)
+
+struct RpcDestActorFlagsHeaders {
+  int op;
+  long long actor_id;
+  int flags;
+};
+
+struct RpcDestActorHeaders {
+  int op;
+  long long actor_id;
+};
+
+struct RpcDestFlagsHeaders {
+  int op;
+  int flags;
+};
+
+union OptionalRpcHeaders {
+  RpcDestActorFlagsHeaders rpc_dest_actor_flags;
+  struct {
+    char padding_1[sizeof(RpcDestActorFlagsHeaders) - sizeof(RpcDestActorHeaders)];
+    RpcDestActorHeaders rpc_dest_actor;
+  };
+  struct {
+    char padding_2[sizeof(RpcDestActorFlagsHeaders) - sizeof(RpcDestFlagsHeaders)];
+    RpcDestFlagsHeaders rpc_dest_flags;
+  };
+};
+
 struct RpcHeaders {
-  // reserved optional headers:
-  int op{-1};             // reserved for TL_RPC_DEST_ACTOR
-  long long actor_id{-1}; // reserved for actor_id
+  OptionalRpcHeaders reserved{};
+
   // normal headers:
   int length{-1};
   int num{-1};
@@ -349,16 +376,10 @@ struct RpcHeaders {
   explicit RpcHeaders(int type)
     : type(type) {}
 };
+
 #pragma pack(pop)
 
 static string_buffer data_buf;
-static constexpr size_t data_buf_optional_headers_reserved_size = sizeof(std::declval<RpcHeaders>().op) + sizeof(std::declval<RpcHeaders>().actor_id);
-static constexpr size_t data_buf_normal_headers_size = sizeof(std::declval<RpcHeaders>().length) + sizeof(std::declval<RpcHeaders>().num)
-                                                       + sizeof(std::declval<RpcHeaders>().type) + sizeof(std::declval<RpcHeaders>().req_id);
-static constexpr size_t data_buf_header_size = data_buf_optional_headers_reserved_size + data_buf_normal_headers_size;
-
-static_assert(sizeof(RpcHeaders) == data_buf_header_size, "Incorrect size of RpcHeaders");
-
 
 bool rpc_stored;
 static int64_t rpc_pack_threshold;
@@ -571,13 +592,13 @@ bool rpc_store(bool is_error) {
   }
 
   if (!is_error) {
-    rpc_pack_from = data_buf_header_size;
+    rpc_pack_from = sizeof(RpcHeaders);
     f$store_finish_gzip_pack(rpc_pack_threshold);
   }
 
   store_int(-1); // reserve for crc32
   rpc_stored = true;
-  rpc_answer(data_buf.c_str() + data_buf_optional_headers_reserved_size, (int)(data_buf.size() - data_buf_optional_headers_reserved_size));
+  rpc_answer(data_buf.c_str() + sizeof(OptionalRpcHeaders), (int)(data_buf.size() - sizeof(OptionalRpcHeaders)));
   return true;
 }
 
@@ -706,18 +727,34 @@ int64_t rpc_send(const class_instance<C$RpcConnection> &conn, double timeout, bo
   store_int(-1); // reserve for crc32
   php_assert (data_buf.size() % sizeof(int) == 0);
 
-  int reserved = data_buf_optional_headers_reserved_size;
-  const char *answer_begin = data_buf.c_str() + data_buf_header_size;
+  int reserved = sizeof(OptionalRpcHeaders);
+  const char *answer_begin = data_buf.c_str() + sizeof(RpcHeaders);
   int function_magic = *(int *)answer_begin;
   bool need_actor = conn.get()->default_actor_id != 0 && vk::none_of_equal(function_magic, TL_RPC_DEST_ACTOR, TL_RPC_DEST_ACTOR_FLAGS);
+  bool need_flags = ignore_answer && vk::none_of_equal(function_magic, TL_RPC_DEST_FLAGS, TL_RPC_DEST_ACTOR_FLAGS);
 
-  if (need_actor) {
+  if (need_actor || need_flags) {
     RpcHeaders &headers = *const_cast<RpcHeaders *>(reinterpret_cast<const RpcHeaders *>(data_buf.c_str()));
+    if (need_actor && need_flags) {
+      reserved -= static_cast<int>(sizeof(headers.reserved.rpc_dest_actor_flags));
+      php_assert (reserved >= 0);
 
-    reserved -= static_cast<int>(sizeof(headers.op) + sizeof(headers.actor_id));
-    php_assert (reserved >= 0);
-    headers.op = TL_RPC_DEST_ACTOR;
-    headers.actor_id = conn.get()->default_actor_id;
+      headers.reserved.rpc_dest_actor_flags.op = TL_RPC_DEST_ACTOR_FLAGS;
+      headers.reserved.rpc_dest_actor_flags.actor_id = conn.get()->default_actor_id;
+      headers.reserved.rpc_dest_actor_flags.flags = vk::tl::common::rpc_invoke_req_extra_flags::no_result;
+    } else if (need_actor) {
+      reserved -= static_cast<int>(sizeof(headers.reserved.rpc_dest_actor));
+      php_assert (reserved >= 0);
+
+      headers.reserved.rpc_dest_actor.op = TL_RPC_DEST_ACTOR;
+      headers.reserved.rpc_dest_actor.actor_id = conn.get()->default_actor_id;
+    } else if (need_flags) {
+      reserved -= static_cast<int>(sizeof(headers.reserved.rpc_dest_flags));
+      php_assert (reserved >= 0);
+
+      headers.reserved.rpc_dest_flags.op = TL_RPC_DEST_FLAGS;
+      headers.reserved.rpc_dest_flags.flags = vk::tl::common::rpc_invoke_req_extra_flags::no_result;
+    }
   }
 
   const auto request_size = static_cast<size_t>(data_buf.size() - reserved);
